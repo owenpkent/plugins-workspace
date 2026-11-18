@@ -6992,7 +6992,8 @@ dependencies = [
  "thiserror 2.0.12",
  "url",
  "windows 0.62.2",
- "zbus 5.9.0",
+ "zbus 6.2.1",
+ "zruntime",
 ]
 
 [[package]]

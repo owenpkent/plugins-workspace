@@ -213,32 +213,43 @@ mod imp {
     use std::path::PathBuf;
 
     pub fn reveal_items_in_dir(paths: &[PathBuf]) -> crate::Result<()> {
-        // `zbus::blocking` starts its own tokio runtime when zbus is built with the `tokio` feature,
-        // which panics with "Cannot start a runtime from within a runtime" if the caller is already
-        // inside one (e.g. an async command), so always run it on a dedicated thread.
+        // zbus 6 has no blocking API, so a `block_on` drives the async calls.
+        //
+        // `zruntime::block_on` is what `zbus::block_on` calls unless zbus's `tokio` feature is on:
+        // it drives the connection on the calling thread, on a runtime of that thread's own. Any
+        // crate in the app can turn that feature on, and `zbus::block_on` then runs on one Tokio
+        // runtime shared by the whole process, where this call can hang if the caller is inside
+        // `zbus::block_on` too (in a notify-rust action handler, for example).
+        //
+        // The dedicated thread is still needed. Without it, `zruntime::block_on` panics when the
+        // caller is a task of zbus's own runtime (a method of a served D-Bus interface, for
+        // example). And with zbus's `tokio` feature on, a connection built inside a Tokio runtime
+        // runs on that runtime, so a caller in a Tokio task would block the runtime it waits for.
+        //
+        // This relies on `zruntime` here being the same crate that zbus uses, see `Cargo.toml`.
         std::thread::scope(|s| {
-            s.spawn(|| reveal_items_in_dir_blocking(paths))
+            s.spawn(|| zruntime::block_on(reveal_items_in_dir_async(paths)))
                 .join()
                 .unwrap_or_else(|e| std::panic::resume_unwind(e))
         })
     }
 
-    fn reveal_items_in_dir_blocking(paths: &[PathBuf]) -> crate::Result<()> {
-        let connection = zbus::blocking::Connection::session()?;
+    async fn reveal_items_in_dir_async(paths: &[PathBuf]) -> crate::Result<()> {
+        let connection = zbus::Connection::session().await?;
 
-        reveal_with_filemanager1(paths, &connection).or_else(|e| {
+        match reveal_with_filemanager1(paths, &connection).await {
+            Ok(()) => Ok(()),
             // Fallback to opening the directory of the first item if revealing multiple items fails.
-            if let Some(first_path) = paths.first() {
-                reveal_with_open_uri_portal(first_path, &connection)
-            } else {
-                Err(e)
-            }
-        })
+            Err(e) => match paths.first() {
+                Some(first_path) => reveal_with_open_uri_portal(first_path, &connection).await,
+                None => Err(e),
+            },
+        }
     }
 
-    fn reveal_with_filemanager1(
+    async fn reveal_with_filemanager1(
         paths: &[PathBuf],
-        connection: &zbus::blocking::Connection,
+        connection: &zbus::Connection,
     ) -> crate::Result<()> {
         let uris: Result<Vec<_>, _> = paths
             .iter()
@@ -259,14 +270,14 @@ mod imp {
             async fn ShowItems(&self, name: Vec<&str>, arg2: &str) -> crate::Result<()>;
         }
 
-        let proxy = FileManager1ProxyBlocking::new(connection)?;
+        let proxy = FileManager1Proxy::new(connection).await?;
 
-        proxy.ShowItems(uri_strs, "")
+        proxy.ShowItems(uri_strs, "").await
     }
 
-    fn reveal_with_open_uri_portal(
+    async fn reveal_with_open_uri_portal(
         path: &Path,
-        connection: &zbus::blocking::Connection,
+        connection: &zbus::Connection,
     ) -> crate::Result<()> {
         let uri = url::Url::from_file_path(path)
             .map_err(|_| crate::Error::FailedToConvertPathToFileUrl)?;
@@ -285,9 +296,28 @@ mod imp {
             ) -> crate::Result<()>;
         }
 
-        let proxy = PortalDesktopProxyBlocking::new(connection)?;
+        let proxy = PortalDesktopProxy::new(connection).await?;
 
-        proxy.OpenDirectory("", uri.as_str(), HashMap::new())
+        proxy.OpenDirectory("", uri.as_str(), HashMap::new()).await
+    }
+
+    #[cfg(test)]
+    mod tests {
+        // `reveal_items_in_dir` needs the plugin's `zruntime` to be the one zbus uses. If they
+        // were two copies, a task spawned here would not run on the thread inside zbus's
+        // `block_on`.
+        #[test]
+        fn zruntime_is_shared_with_zbus() {
+            let (thread, on_tokio) = zbus::block_on(async {
+                let on_tokio = tauri::async_runtime::TokioHandle::try_current().is_ok();
+                let thread = zruntime::spawn(async { std::thread::current().id() }).await;
+                (thread.unwrap(), on_tokio)
+            });
+            // With zbus's `tokio` feature on, `zbus::block_on` is Tokio's and shows nothing.
+            if !on_tokio {
+                assert_eq!(thread, std::thread::current().id());
+            }
+        }
     }
 }
 
